@@ -1,5 +1,0 @@
-Space
------
-
-.. automodule:: space
-   :members:

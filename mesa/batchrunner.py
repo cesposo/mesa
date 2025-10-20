@@ -1,148 +1,234 @@
-# -*- coding: utf-8 -*-
+"""batchrunner for running a factorial experiment design over a model.
+
+To take advantage of parallel execution of experiments, `batch_run` uses
+multiprocessing if ``number_processes`` is larger than 1. It is strongly advised
+to only run in parallel using a normal python file (so don't try to do it in a
+jupyter notebook). This is because Jupyter notebooks have a different execution
+model that can cause issues with Python's multiprocessing module, especially on
+Windows. The main problems include the lack of a traditional __main__ entry
+point, serialization issues, and potential deadlocks.
+
+Moreover, best practice when using multiprocessing is to
+put the code inside an ``if __name__ == '__main__':`` code black as shown below::
+
+    from mesa.batchrunner import batch_run
+
+    params = {"width": 10, "height": 10, "N": range(10, 500, 10)}
+
+    if __name__ == '__main__':
+        results = batch_run(
+            MoneyModel,
+            parameters=params,
+            iterations=5,
+            max_steps=100,
+            number_processes=None,
+            data_collection_period=1,
+            display_progress=True,
+        )
+
 """
-Batchrunner
-===========
 
-A single class to manage a batch run or parameter sweep of a given model.
+import itertools
+import multiprocessing
+from collections.abc import Iterable, Mapping
+from functools import partial
+from multiprocessing import Pool
+from typing import Any
 
-"""
-from itertools import product
-import pandas as pd
+from tqdm.auto import tqdm
+
+from mesa.model import Model
+
+multiprocessing.set_start_method("spawn", force=True)
 
 
-class BatchRunner:
-    """ This class is instantiated with a model class, and model parameters
-    associated with one or more values. It is also instantiated with model and
-    agent-level reporters, dictionaries mapping a variable name to a function
-    which collects some data from the model or its agents at the end of the run
-    and stores it.
+def batch_run(
+    model_cls: type[Model],
+    parameters: Mapping[str, Any | Iterable[Any]],
+    # We still retain the Optional[int] because users may set it to None (i.e. use all CPUs)
+    number_processes: int | None = 1,
+    iterations: int = 1,
+    data_collection_period: int = -1,
+    max_steps: int = 1000,
+    display_progress: bool = True,
+) -> list[dict[str, Any]]:
+    """Batch run a mesa model with a set of parameter values.
 
-    Note that by default, the reporters only collect data at the *end* of the
-    run. To get step by step data, simply have a reporter store the model's
-    entire DataCollector object.
+    Args:
+        model_cls (Type[Model]): The model class to batch-run
+        parameters (Mapping[str, Union[Any, Iterable[Any]]]): Dictionary with model parameters over which to run the model. You can either pass single values or iterables.
+        number_processes (int, optional): Number of processes used, by default 1. Set this to None if you want to use all CPUs.
+        iterations (int, optional): Number of iterations for each parameter combination, by default 1
+        data_collection_period (int, optional): Number of steps after which data gets collected, by default -1 (end of episode)
+        max_steps (int, optional): Maximum number of model steps after which the model halts, by default 1000
+        display_progress (bool, optional): Display batch run process, by default True
+
+    Returns:
+        List[Dict[str, Any]]
+
+    Notes:
+        batch_run assumes the model has a `datacollector` attribute that has a DataCollector object initialized.
 
     """
-    def __init__(self, model_cls, parameter_values, iterations=1,
-                 max_steps=1000, model_reporters=None, agent_reporters=None):
-        """ Create a new BatchRunner for a given model with the given
-        parameters.
+    runs_list = []
+    run_id = 0
+    for iteration in range(iterations):
+        for kwargs in _make_model_kwargs(parameters):
+            runs_list.append((run_id, iteration, kwargs))
+            run_id += 1
 
-        Args:
-            model_cls: The class of model to batch-run.
-            parameter_values: Dictionary of parameters to their values or
-                ranges of values. For example:
-                    {"param_1": range(5),
-                     "param_2": [1, 5, 10],
-                      "const_param": 100}
-            iterations: The total number of times to run the model for each
-                combination of parameters.
-            max_steps: The upper limit of steps above which each run will be halted
-                if it hasn't halted on its own.
-            model_reporters: The dictionary of variables to collect on each run at
-                the end, with variable names mapped to a function to collect
-                them. For example:
-                    {"agent_count": lambda m: m.schedule.get_agent_count()}
-            agent_reporters: Like model_reporters, but each variable is now
-                collected at the level of each agent present in the model at
-                the end of the run.
+    process_func = partial(
+        _model_run_func,
+        model_cls,
+        max_steps=max_steps,
+        data_collection_period=data_collection_period,
+    )
 
-        """
-        self.model_cls = model_cls
-        self.parameter_values = {param: self.make_iterable(vals)
-                                 for param, vals in parameter_values.items()}
-        self.iterations = iterations
-        self.max_steps = max_steps
+    results: list[dict[str, Any]] = []
 
-        self.model_reporters = model_reporters
-        self.agent_reporters = agent_reporters
-
-        if self.model_reporters:
-            self.model_vars = {}
-
-        if self.agent_reporters:
-            self.agent_vars = {}
-
-    def run_all(self):
-        """ Run the model at all parameter combinations and store results. """
-        params = self.parameter_values.keys()
-        param_ranges = self.parameter_values.values()
-        run_count = 0
-        for param_values in list(product(*param_ranges)):
-            kwargs = dict(zip(params, param_values))
-            for _ in range(self.iterations):
-                model = self.model_cls(**kwargs)
-                self.run_model(model)
-                # Collect and store results:
-                if self.model_reporters:
-                    key = tuple(list(param_values) + [run_count])
-                    self.model_vars[key] = self.collect_model_vars(model)
-                if self.agent_reporters:
-                    agent_vars = self.collect_agent_vars(model)
-                    for agent_id, reports in agent_vars.items():
-                        key = tuple(list(param_values) + [run_count, agent_id])
-                        self.agent_vars[key] = reports
-                run_count += 1
-
-    def run_model(self, model):
-        """ Run a model object to completion, or until reaching max steps.
-
-        If your model runs in a non-standard way, this is the method to modify
-        in your subclass.
-
-        """
-        while model.running and model.schedule.steps < self.max_steps:
-            model.step()
-
-    def collect_model_vars(self, model):
-        """ Run reporters and collect model-level variables. """
-        model_vars = {}
-        for var, reporter in self.model_reporters.items():
-            model_vars[var] = reporter(model)
-        return model_vars
-
-    def collect_agent_vars(self, model):
-        """ Run reporters and collect agent-level variables. """
-        agent_vars = {}
-        for agent in model.schedule.agents:
-            agent_record = {}
-            for var, reporter in self.agent_reporters.items():
-                agent_record[var] = reporter(agent)
-            agent_vars[agent.unique_id] = agent_record
-        return agent_vars
-
-    def get_model_vars_dataframe(self):
-        """ Generate a pandas DataFrame from the model-level variables collected.
-
-        """
-        index_col_names = list(self.parameter_values.keys())
-        index_col_names.append("Run")
-        records = []
-        for key, val in self.model_vars.items():
-            record = dict(zip(index_col_names, key))
-            for k, v in val.items():
-                record[k] = v
-            records.append(record)
-        return pd.DataFrame(records)
-
-    def get_agent_vars_dataframe(self):
-        """ Generate a pandas DataFrame from the agent-level variables
-        collected.
-
-        """
-        index_col_names = list(self.parameter_values.keys())
-        index_col_names += ["Run", "AgentID"]
-        records = []
-        for key, val in self.agent_vars.items():
-            record = dict(zip(index_col_names, key))
-            for k, v in val.items():
-                record[k] = v
-            records.append(record)
-        return pd.DataFrame(records)
-
-    @staticmethod
-    def make_iterable(val):
-        """ Helper method to ensure a value is a non-string iterable. """
-        if hasattr(val, "__iter__") and not isinstance(val, str):
-            return val
+    with tqdm(total=len(runs_list), disable=not display_progress) as pbar:
+        if number_processes == 1:
+            for run in runs_list:
+                data = process_func(run)
+                results.extend(data)
+                pbar.update()
         else:
-            return [val]
+            with Pool(number_processes) as p:
+                for data in p.imap_unordered(process_func, runs_list):
+                    results.extend(data)
+                    pbar.update()
+
+    return results
+
+
+def _make_model_kwargs(
+    parameters: Mapping[str, Any | Iterable[Any]],
+) -> list[dict[str, Any]]:
+    """Create model kwargs from parameters dictionary.
+
+    Parameters
+    ----------
+    parameters : Mapping[str, Union[Any, Iterable[Any]]]
+        Single or multiple values for each model parameter name.
+
+        Allowed values for each parameter:
+        - A single value (e.g., `32`, `"relu"`).
+        - A non-empty iterable (e.g., `[0.01, 0.1]`, `["relu", "sigmoid"]`).
+
+        Not allowed:
+        - Empty lists or empty iterables (e.g., `[]`, `()`, etc.). These should be removed manually.
+
+    Returns:
+    -------
+    List[Dict[str, Any]]
+        A list of all kwargs combinations.
+    """
+    parameter_list = []
+    for param, values in parameters.items():
+        if isinstance(values, str):
+            # The values is a single string, so we shouldn't iterate over it.
+            all_values = [(param, values)]
+        elif isinstance(values, list | tuple | set) and len(values) == 0:
+            # If it's an empty iterable, raise an error
+            raise ValueError(
+                f"Parameter '{param}' contains an empty iterable, which is not allowed."
+            )
+
+        else:
+            try:
+                all_values = [(param, value) for value in values]
+            except TypeError:
+                all_values = [(param, values)]
+        parameter_list.append(all_values)
+    all_kwargs = itertools.product(*parameter_list)
+    kwargs_list = [dict(kwargs) for kwargs in all_kwargs]
+    return kwargs_list
+
+
+def _model_run_func(
+    model_cls: type[Model],
+    run: tuple[int, int, dict[str, Any]],
+    max_steps: int,
+    data_collection_period: int,
+) -> list[dict[str, Any]]:
+    """Run a single model run and collect model and agent data.
+
+    Parameters
+    ----------
+    model_cls : Type[Model]
+        The model class to batch-run
+    run: Tuple[int, int, Dict[str, Any]]
+        The run id, iteration number, and kwargs for this run
+    max_steps : int
+        Maximum number of model steps after which the model halts, by default 1000
+    data_collection_period : int
+        Number of steps after which data gets collected
+
+    Returns:
+    -------
+    List[Dict[str, Any]]
+        Return model_data, agent_data from the reporters
+    """
+    run_id, iteration, kwargs = run
+    model = model_cls(**kwargs)
+    while model.running and model.steps <= max_steps:
+        model.step()
+
+    data = []
+
+    steps = list(range(0, model.steps, data_collection_period))
+    if not steps or steps[-1] != model.steps - 1:
+        steps.append(model.steps - 1)
+
+    for step in steps:
+        model_data, all_agents_data = _collect_data(model, step)
+
+        # If there are agent_reporters, then create an entry for each agent
+        if all_agents_data:
+            stepdata = [
+                {
+                    "RunId": run_id,
+                    "iteration": iteration,
+                    "Step": step,
+                    **kwargs,
+                    **model_data,
+                    **agent_data,
+                }
+                for agent_data in all_agents_data
+            ]
+        # If there is only model data, then create a single entry for the step
+        else:
+            stepdata = [
+                {
+                    "RunId": run_id,
+                    "iteration": iteration,
+                    "Step": step,
+                    **kwargs,
+                    **model_data,
+                }
+            ]
+        data.extend(stepdata)
+
+    return data
+
+
+def _collect_data(
+    model: Model,
+    step: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Collect model and agent data from a model using mesas datacollector."""
+    if not hasattr(model, "datacollector"):
+        raise AttributeError(
+            "The model does not have a datacollector attribute. Please add a DataCollector to your model."
+        )
+    dc = model.datacollector
+
+    model_data = {param: values[step] for param, values in dc.model_vars.items()}
+
+    all_agents_data = []
+    raw_agent_data = dc._agent_records.get(step, [])
+    for data in raw_agent_data:
+        agent_dict = {"AgentID": data[1]}
+        agent_dict.update(zip(dc.agent_reporters, data[2:]))
+        all_agents_data.append(agent_dict)
+    return model_data, all_agents_data

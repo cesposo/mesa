@@ -1,3 +1,10 @@
+# Benchmarking
+benchmarks/**/*.pickle
+
+# exampledocs
+docs/examples/*
+docs/example.md
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -11,6 +18,9 @@ __pycache__/
 # Distribution / packaging
 .Python
 env/
+venv/
+pythonenv*/
+.venv/
 build/
 develop-eggs/
 dist/
@@ -42,6 +52,7 @@ htmlcov/
 .cache
 nosetests.xml
 coverage.xml
+.pytest_cache/
 
 # Translations
 *.mo
@@ -58,12 +69,27 @@ target/
 
 # Jupyter and iPython notebook checkpoints
 *.ipynb_checkpoints
+*.virtual_documents
 
 # Spyder app workspace config file
 .spyderworkspace
 
 # PyCharm environment files
 .idea/
+*.pclprof
+
+# VSCode environment files
+.vscode/
+*.code-workspace
 
 # Apple OSX
 *.DS_Store
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# JS dependencies
+mesa/visualization/templates/external/
+mesa/visualization/templates/js/external/
